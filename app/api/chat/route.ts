@@ -1,4 +1,4 @@
-import Anthropic from "@anthropic-ai/sdk";
+import Anthropic from "@anthropic-ai/sdk"
 
 const anthropic = new Anthropic({
   // defaults to process.env["ANTHROPIC_API_KEY"]
