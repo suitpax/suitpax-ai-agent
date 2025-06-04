@@ -92,7 +92,7 @@ A user submits the following query:
    - Sorts hotels by proximity to the city center, price, and ratings.
 
 4. **Present Results**:
-   ```plaintext
+   \`\`\`plaintext
    <response>
    <flights>
    - Airline: British Airways, Departure: 10:00 AM, Price: $450, Non-stop
@@ -108,33 +108,33 @@ A user submits the following query:
    Two flight options and two hotel options have been found matching your criteria. Both hotels are close to the city center and within your budget.
    </summary>
    </response>
-   ```
+   \`\`\`
 
 ---
 
 ## Installation and Setup
 
 1. Clone the repository:
-   ```bash
+   \`\`\`bash
    git clone https://github.com/suitpax/suitpax-ai-agent.git
-   ```
+   \`\`\`
 
 2. Install dependencies:
-   ```bash
+   \`\`\`bash
    npm install
-   ```
+   \`\`\`
 
 3. Set up environment variables:
    - Create a `.env` file in the root directory.
    - Add your Anthropic API key:
-     ```env
+     \`\`\`env
      ANTHROPIC_API_KEY=your_api_key_here
-     ```
+     \`\`\`
 
 4. Start the application:
-   ```bash
+   \`\`\`bash
    npm start
-   ```
+   \`\`\`
 
 ---
 
