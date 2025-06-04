@@ -1,7 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 
-// Initialize Anthropic client with API key (defaults to process.env["ANTHROPIC_API_KEY"])
+// Initialize Anthropic client with API key
 const anthropic = new Anthropic({
   apiKey: process.env["ANTHROPIC_API_KEY"] || "",
 });
@@ -45,7 +45,6 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Replace placeholders like {{SEARCH_QUERY}} with the user's input message
     const prompt = `
       You are Suitpax AI, an advanced business travel assistant designed to help employees find flights, hotels, and other travel services. Your task is to interpret user queries, use provided functions to gather information, and present organized results.
 
@@ -83,7 +82,7 @@ export async function POST(request: NextRequest) {
 
       <response>
       <flights>
-      [List the top flight options here, including airline, departure and arrival times, price, and any layovers]
+      [List the top flight options here, including airline, departure and arrival times, price, and layovers]
       </flights>
 
       <hotels>
@@ -108,11 +107,11 @@ export async function POST(request: NextRequest) {
 
     let response;
     try {
-      // Make the API call to Anthropic Console
+      // Make the API call to Anthropic
       const result = await anthropic.messages.create({
-        model: "claude-3-7-sonnet-20250219",
-        max_tokens: 20000,
-        temperature: 1,
+        model: "claude-3-5-sonnet-20241022", // ✅ Modelo correcto
+        max_tokens: 4000, // Reducido para mejor rendimiento
+        temperature: 0.3, // ✅ Mejor para asistente de viajes
         messages: [
           {
             role: "user",
@@ -121,23 +120,28 @@ export async function POST(request: NextRequest) {
         ],
       });
 
-      // Extract and return the assistant's response
-      response = result.messages[1]?.content?.text || "No response received from the AI.";
+      // ✅ Acceso correcto a la respuesta
+      response = result.content[0]?.text || "No response received from the AI.";
+      
     } catch (error) {
       console.error("Error calling Anthropic API:", error);
 
-      if (error.message.includes("authentication") || error.message.includes("401")) {
+      // Manejo de errores más específico
+      if (error?.status === 401 || error?.message?.includes("authentication")) {
         response = "Authentication error: Please check your API key configuration.";
-      } else if (error.message.includes("rate_limit") || error.message.includes("429")) {
+      } else if (error?.status === 429 || error?.message?.includes("rate_limit")) {
         response = "Rate limit exceeded: Please try again later.";
-      } else if (error.message.includes("timeout")) {
+      } else if (error?.message?.includes("timeout")) {
         response = "Request timeout: The request took too long to process. Please try again.";
+      } else if (error?.status === 400) {
+        response = "Invalid request: Please check your input and try again.";
       } else {
         response = "An unexpected error occurred while processing your request.";
       }
     }
 
     return NextResponse.json({ response }, { status: 200 });
+    
   } catch (error) {
     console.error("Internal server error:", error);
 
