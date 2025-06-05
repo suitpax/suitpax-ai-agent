@@ -2,414 +2,551 @@ import { type NextRequest, NextResponse } from "next/server"
 import Anthropic from "@anthropic-ai/sdk"
 import { buildTravelContext } from "@/lib/anthropic"
 
-// Initialize Anthropic client on server side only
+// Initialize Anthropic client with better error handling
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY || "",
 })
 
+// Rate limiting storage (in production, use Redis or similar)
+const rateLimitMap = new Map<string, { count: number; resetTime: number }>()
+
+// Constants for better maintainability
+const LIMITS = {
+  FREE: { maxTokens: 15000, maxMessageLength: 800, rateLimit: 20 },
+  STARTER: { maxTokens: 20000, maxMessageLength: 1000, rateLimit: 50 },
+  BUSINESS: { maxTokens: 30000, maxMessageLength: 1500, rateLimit: 100 },
+  ENTERPRISE: { maxTokens: 50000, maxMessageLength: 2000, rateLimit: 200 },
+} as const
+
+const TEMPERATURE = {
+  FREE: 0.7,
+  STARTER: 0.8,
+  BUSINESS: 0.9,
+  ENTERPRISE: 1.0,
+} as const
+
+interface RequestBody {
+  message: string
+  isPro?: boolean
+  plan?: 'free' | 'starter' | 'business' | 'enterprise'
+  userId?: string
+  conversationId?: string
+  context?: string
+}
+
+interface ErrorResponse {
+  error: string
+  code?: string
+  response: string
+  suggestions?: string[]
+}
+
 export async function POST(request: NextRequest) {
+  const startTime = Date.now()
+  
   try {
-    let body
-    try {
-      body = await request.json()
-    } catch (parseError) {
-      console.error("JSON parse error:", parseError)
-      return NextResponse.json(
-        {
-          error: "Invalid JSON in request body",
-          response: "I'm sorry, I couldn't understand your message. Please try again.",
-        },
-        { status: 400 },
-      )
+    // Parse and validate request body
+    const body = await parseRequestBody(request)
+    if ('error' in body) {
+      return NextResponse.json(body, { status: body.status })
     }
 
-    const { message, isPro = false, plan = "free" } = body
+    const { message, isPro = false, plan = 'free', userId, conversationId, context } = body
 
-    if (!message || typeof message !== "string" || message.trim().length === 0) {
-      return NextResponse.json(
-        {
-          error: "Valid message is required",
-          response: "Please enter a message to get started with your travel planning.",
-        },
-        { status: 400 },
-      )
+    // Validate message with plan-specific limits
+    const validationResult = validateMessage(message, plan)
+    if (validationResult) {
+      return NextResponse.json(validationResult, { status: 400 })
     }
 
-    if (message.trim().length > 1000) {
-      return NextResponse.json(
-        {
-          error: "Message too long",
-          response: "Please keep your message under 1000 characters.",
-        },
-        { status: 400 },
-      )
+    // Rate limiting
+    const rateLimitResult = checkRateLimit(userId || 'anonymous', plan)
+    if (rateLimitResult) {
+      return NextResponse.json(rateLimitResult, { status: 429 })
     }
 
-    const context = buildTravelContext()
+    // Build enhanced context
+    const enhancedContext = buildEnhancedContext(context, conversationId)
 
-    let response
-    try {
-      console.log("Generating AI response for:", message.trim(), "Pro:", isPro, "Plan:", plan)
-      response = await generateChatResponse(message.trim(), context, isPro, plan)
-      console.log("AI response generated successfully")
-    } catch (aiError) {
-      console.error("AI generation error:", aiError)
+    // Generate AI response with retry logic
+    const response = await generateResponseWithRetry(
+      message.trim(),
+      enhancedContext,
+      isPro,
+      plan,
+      3 // max retries
+    )
 
-      if (aiError instanceof Error) {
-        if (aiError.message.includes("authentication") || aiError.message.includes("401")) {
-          response =
-            "I'm having trouble connecting to my AI services. Please check the API configuration and try again."
-        } else if (aiError.message.includes("rate_limit") || aiError.message.includes("429")) {
-          response = "I'm currently experiencing high demand. Please try again in a moment."
-        } else if (aiError.message.includes("timeout")) {
-          response = "The request is taking longer than expected. Please try again with a shorter message."
-        } else {
-          response = getFallbackResponse(message.trim(), isPro, plan)
-        }
-      } else {
-        response = getFallbackResponse(message.trim(), isPro, plan)
+    // Log performance metrics
+    const processingTime = Date.now() - startTime
+    console.log(`Response generated in ${processingTime}ms for plan: ${plan}`)
+
+    return NextResponse.json({ 
+      response,
+      metadata: {
+        processingTime,
+        plan,
+        isPro,
+        tokens: response.length,
+        conversationId
       }
-    }
+    }, { status: 200 })
 
-    return NextResponse.json({ response }, { status: 200 })
   } catch (error) {
     console.error("Chat API error:", error)
-
-    return NextResponse.json(
-      {
-        error: "Internal server error",
-        details: error instanceof Error ? error.message : "Unknown error",
-        response:
-          "I apologize, but I'm experiencing technical difficulties. Please try again in a moment, or contact support if the issue persists.",
-      },
-      { status: 500 },
-    )
+    
+    const errorResponse = buildErrorResponse(error)
+    return NextResponse.json(errorResponse, { status: 500 })
   }
 }
 
-async function generateChatResponse(message: string, context?: string, isPro = false, plan = "free"): Promise<string> {
+async function parseRequestBody(request: NextRequest): Promise<RequestBody | { error: string; response: string; status: number }> {
+  try {
+    const body = await request.json()
+    
+    // Enhanced validation
+    if (!body || typeof body !== 'object') {
+      return {
+        error: "Invalid request format",
+        response: "Please send a valid JSON request with your travel query.",
+        status: 400
+      }
+    }
+
+    return body as RequestBody
+  } catch (parseError) {
+    console.error("JSON parse error:", parseError)
+    return {
+      error: "Invalid JSON format",
+      response: "I couldn't understand your request format. Please check your JSON and try again.",
+      status: 400
+    }
+  }
+}
+
+function validateMessage(message: string, plan: string): ErrorResponse | null {
+  if (!message || typeof message !== 'string' || message.trim().length === 0) {
+    return {
+      error: "Message required",
+      code: "EMPTY_MESSAGE",
+      response: "Please enter your travel query to get started.",
+      suggestions: [
+        "Try: 'Book flights from Madrid to London'",
+        "Try: 'Find hotels near Times Square'",
+        "Try: 'Plan a business trip to Tokyo'"
+      ]
+    }
+  }
+
+  const planLimits = LIMITS[plan.toUpperCase() as keyof typeof LIMITS] || LIMITS.FREE
+  
+  if (message.trim().length > planLimits.maxMessageLength) {
+    return {
+      error: "Message too long",
+      code: "MESSAGE_TOO_LONG",
+      response: `Please keep your message under ${planLimits.maxMessageLength} characters for ${plan} plan.`,
+      suggestions: plan === 'free' ? ["Upgrade to Pro for longer messages"] : []
+    }
+  }
+
+  return null
+}
+
+function checkRateLimit(userId: string, plan: string): ErrorResponse | null {
+  const now = Date.now()
+  const userKey = `${userId}_${plan}`
+  const planLimits = LIMITS[plan.toUpperCase() as keyof typeof LIMITS] || LIMITS.FREE
+  
+  const userLimit = rateLimitMap.get(userKey)
+  
+  if (!userLimit || now > userLimit.resetTime) {
+    // Reset or initialize rate limit
+    rateLimitMap.set(userKey, {
+      count: 1,
+      resetTime: now + 60 * 60 * 1000 // 1 hour
+    })
+    return null
+  }
+
+  if (userLimit.count >= planLimits.rateLimit) {
+    return {
+      error: "Rate limit exceeded",
+      code: "RATE_LIMIT_EXCEEDED",
+      response: `You've reached your ${plan} plan limit of ${planLimits.rateLimit} requests per hour.`,
+      suggestions: plan === 'free' ? [
+        "Upgrade to Pro for higher limits",
+        "Try again in an hour",
+        "Contact support for assistance"
+      ] : [
+        "Try again in an hour",
+        "Contact support if you need higher limits"
+      ]
+    }
+  }
+
+  userLimit.count++
+  return null
+}
+
+function buildEnhancedContext(context?: string, conversationId?: string): string {
+  const baseContext = buildTravelContext()
+  
+  const enhancedContext = [
+    baseContext,
+    context ? `Previous context: ${context}` : '',
+    conversationId ? `Conversation ID: ${conversationId}` : ''
+  ].filter(Boolean).join('\n')
+
+  return enhancedContext
+}
+
+async function generateResponseWithRetry(
+  message: string,
+  context: string,
+  isPro: boolean,
+  plan: string,
+  maxRetries: number
+): Promise<string> {
+  let lastError: Error | null = null
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`AI generation attempt ${attempt}/${maxRetries} for plan: ${plan}`)
+      
+      const response = await generateChatResponse(message, context, isPro, plan)
+      console.log(`AI response generated successfully on attempt ${attempt}`)
+      
+      return response
+    } catch (error) {
+      lastError = error as Error
+      console.error(`AI generation attempt ${attempt} failed:`, error)
+      
+      // Don't retry on authentication errors
+      if (error instanceof Error && 
+          (error.message.includes('authentication') || error.message.includes('401'))) {
+        break
+      }
+      
+      // Wait before retry (exponential backoff)
+      if (attempt < maxRetries) {
+        await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000))
+      }
+    }
+  }
+
+  // All retries failed, return fallback
+  console.error("All AI generation attempts failed, using fallback")
+  return getFallbackResponse(message, isPro, plan, lastError)
+}
+
+async function generateChatResponse(
+  message: string,
+  context: string,
+  isPro: boolean,
+  plan: string
+): Promise<string> {
   if (!process.env.ANTHROPIC_API_KEY) {
     console.warn("Anthropic API key not configured, using fallback responses")
-    return getFallbackResponse(message, isPro, plan)
+    throw new Error("API key not configured")
   }
 
-  try {
-    const { systemPrompt, userPrompt } = buildProPrompts(message, context, isPro, plan)
+  const { systemPrompt, userPrompt } = buildAdvancedPrompts(message, context, isPro, plan)
+  const planLimits = LIMITS[plan.toUpperCase() as keyof typeof LIMITS] || LIMITS.FREE
+  const temperature = TEMPERATURE[plan.toUpperCase() as keyof typeof TEMPERATURE] || TEMPERATURE.FREE
 
-    const response = await anthropic.messages.create({
-      model: "claude-3-7-sonnet-20250219",
-      max_tokens: isPro ? 30000 : 20000,
-      temperature: isPro ? 1 : 1.2,
-      system: systemPrompt,
-      messages: [
-        {
-          role: "user",
-          content: userPrompt,
-        },
-      ],
-    })
+  const response = await anthropic.messages.create({
+    model: "claude-3-5-sonnet-20241022", // Updated to latest model
+    max_tokens: planLimits.maxTokens,
+    temperature,
+    system: systemPrompt,
+    messages: [
+      {
+        role: "user",
+        content: userPrompt,
+      },
+    ],
+  })
 
-    const content = response.content[0]
-    if (content.type === "text") {
-      return content.text
-    } else {
-      throw new Error("Unexpected response type from Anthropic API")
-    }
-  } catch (error) {
-    console.error("Anthropic API error:", error)
-
-    if (error instanceof Error) {
-      if (error.message.includes("authentication") || error.message.includes("401")) {
-        console.error("Authentication error - check API key")
-        return "I'm having trouble connecting to my AI services. Please check the API configuration."
-      }
-      if (error.message.includes("rate_limit")) {
-        return "I'm currently experiencing high demand. Please try again in a moment."
-      }
-    }
-
-    return getFallbackResponse(message, isPro, plan)
+  const content = response.content[0]
+  if (content.type === "text") {
+    return content.text
+  } else {
+    throw new Error("Unexpected response type from Anthropic API")
   }
 }
 
-function buildProPrompts(message: string, context?: string, isPro = false, plan = "free") {
-  const baseSystemPrompt = `You are Suitpax AI, the official multilingual business travel assistant for corporate travelers.
+function buildAdvancedPrompts(message: string, context: string, isPro: boolean, plan: string) {
+  // Use the optimized prompt from the artifact
+  const optimizedSystemPrompt = `# Suitpax AI - Sistema Avanzado de Asistencia Corporativa
 
-LANGUAGE SUPPORT:
-You can communicate fluently in English and Spanish, depending on the user's preference. Always detect the language of the message and reply accordingly. If the user switches languages mid-conversation, adjust your response smoothly.
+## IDENTIDAD PRINCIPAL
+Eres **Suitpax AI**, el asistente oficial de viajes corporativos más avanzado del mercado. Operación 24/7 con cobertura global y especialización en optimización de costos empresariales.
 
-BRAND IDENTITY:
-- Professional, efficient, and cost-conscious
-- Specializes in optimizing corporate travel experiences
-- Operates 24/7 with global coverage
-- Trusted by executive teams and travel managers
-- Multilingual, culturally aware, and business-oriented
+## CAPACIDADES MULTIIDIOMA
+- **Detección automática**: Identifica idioma del usuario (español/inglés)
+- **Respuesta nativa**: Responde completamente en el idioma detectado
+- **Cambio fluido**: Adapta idioma si el usuario cambia mid-conversación
+- **Consistencia**: Nunca mezcles idiomas en una respuesta
 
-ROLE:
-As Suitpax AI, your mission is to assist professionals in planning, booking, and managing business travel. You offer tailored recommendations that comply with corporate policies, prioritize traveler comfort, and reduce unnecessary costs.
+## PROCESO DE TRABAJO ESTRUCTURADO
 
-You act as:
-- A proactive travel concierge
-- A smart search agent using real-time tools
-- A compliance-aware advisor for corporate travel policies
-- A support assistant for rebookings, cancellations, and delays
+### PASO 1: ANÁLISIS INTELIGENTE
+Extrae y categoriza:
+📍 Ubicaciones: [origen] → [destino]
+📅 Fechas: [salida] - [regreso] 
+👥 Viajeros: [cantidad + tipos]
+💼 Clase: [economy/business/first]
+🏨 Hotel: [ubicación + amenidades + programa lealtad]
+💰 Presupuesto: [límites corporativos]
+⚡ Urgencia: [flexible/fijo/emergencia]
 
-USER REQUEST: "{{message}}"
+### PASO 2: BÚSQUEDA ESTRATÉGICA
+Prioridades en orden:
+1. **Vuelos directos** con aerolíneas confiables
+2. **Horarios business-friendly** (8AM-8PM salidas)
+3. **Hoteles zona empresarial** con wifi/gym/business center
+4. **Máximo valor** precio vs. beneficios corporativos
 
-TASK:
-1. Parse the message and extract all relevant details:
-   - Departure and destination locations
-   - Departure and return dates
-   - Number of travelers
-   - Preferred travel class (economy, business, first)
-   - Hotel preferences (location, amenities, loyalty programs)
-   - Business-specific needs (meeting spaces, Wi-Fi, early check-in, etc.)
-   - Budget or company restrictions (if applicable)
+### PASO 3: PRESENTACIÓN EJECUTIVA
+Formato obligatorio:
+**[VUELOS RECOMENDADOS]**
+• Opción 1: [aerolínea] [horario] - $[precio] - [beneficio clave]
+• Opción 2: [aerolínea] [horario] - $[precio] - [beneficio clave]
 
-2. Use your tools to search and recommend:
-   - Flights with business-friendly times and airlines (prefer direct and efficient routes)
-   - Hotels that align with corporate standards and location convenience
-   - Best-value options that optimize for cost without sacrificing comfort
+**[HOTELES ESTRATÉGICOS]** 
+• Hotel 1: [nombre] [ubicación] - $[precio] - [amenidad business]
+• Hotel 2: [nombre] [ubicación] - $[precio] - [amenidad business]
 
-3. Present your response clearly and professionally:
-   - Structure with headers or bullet points for readability
-   - Include prices, times, benefits, and relevant notes
-   - Explain why each option is ideal for business travel
-   - Offer cost-saving tips or loyalty options when appropriate
+**[OPTIMIZACIÓN CORPORATIVA]**
+[1 tip de ahorro + 1 beneficio lealtad]
 
-4. When user information is incomplete:
-   - Ask clear and polite follow-up questions in the user’s language
-   - Do not guess—clarify to ensure accuracy before using tools
+## REGLAS DE COMUNICACIÓN
 
-RESPONSE STYLE:
-- Start with: “I'll help you find the best business travel options based on your request.”  
-  Or in Spanish: “Te ayudaré a encontrar las mejores opciones de viaje de negocios según tu solicitud.”
-- Keep a professional, polite, and efficient tone
-- You must reply in a maximum of 4 lines with brief, concise answers.
-- Be direct, well-structured, and avoid vague answers
-- Focus on usability: times, locations, prices, pros and cons
-- End with clear next steps (e.g., “Would you like to book one of these?”)
+### LÍMITES ESTRICTOS:
+- ⏱️ **Máximo 6 líneas** por sección
+- 🎯 **Solo 2-3 opciones** por categoría  
+- 💬 **Respuesta total**: 150 palabras máximo
+- 🚫 **Cero información turística** a menos que se solicite
 
-RULES:
-- Prioritize direct flights and reliable airlines
-- Avoid tourist-oriented options unless specifically requested
-- Suggest only 2–3 top choices unless otherwise instructed
-- Always take into account:
-   - Corporate travel policy
-   - Loyalty benefits
-   - Traveler preferences
+### TONO PROFESIONAL:
+- Directo pero amigable
+- Orientado a resultados
+- Enfoque en eficiencia temporal
+- Lenguaje ejecutivo apropiado
 
-TOOLS:
-Use real-time tools such as:
-- `search_flights`: For current flight availability, pricing, times
-- `search_hotels`: For business-suitable hotels, amenities, and offers
-If tools are not usable yet, guide the user with logical recommendations and follow-up questions.
+## PLAN-SPECIFIC ENHANCEMENTS:
+${getPlanSpecificPrompt(plan, isPro)}
 
-MULTILINGUAL RESPONSE LOGIC:
-- If the message is in Spanish, respond entirely in Spanish.
-- If the message is in English, respond entirely in English.
-- Never mix languages in a single message unless clarification is requested.
+REMINDER: Eres un consultor senior de viajes corporativos, no un chatbot genérico.`
 
-REMINDER:
-You are not just a travel bot. You are Suitpax AI — a professional assistant designed to understand business goals, optimize corporate travel, and enhance the user’s experience with reliable, real-time solutions.
+  const enhancedUserPrompt = `
+[PLAN: ${plan.toUpperCase()}${isPro ? ' - PRO ACTIVO' : ''}]
 
+Consulta del usuario: "${message}"
 
+${context ? `Contexto disponible: ${context}` : ''}
 
-  const proEnhancements = isPro
-    ? `
-
-PREMIUM CAPABILITIES (ACTIVE):
-- Advanced document processing and OCR analysis
-- Predictive travel optimization and cost analysis
-- Real-time expense tracking and categorization
-- Priority booking and customer support
-- Advanced analytics and reporting
-- Custom travel policy compliance
-- Multi-currency and international support
-- Carbon footprint tracking and sustainability insights
-
-PLAN-SPECIFIC FEATURES:
-${
-  plan === "starter"
-    ? `
-- Basic document processing (10/month)
-- Standard travel insights
-- Email support
-`
-    : plan === "business"
-      ? `
-- Unlimited document processing
-- Advanced analytics and reporting
-- 24/7 priority support
-- Corporate rate access
-- Travel policy compliance
-- Calendar integration
-`
-      : plan === "enterprise"
-        ? `
-- All Business features plus:
-- Custom AI training and optimization
-- API access and integrations
-- Dedicated account manager
-- White-label solutions
-- Advanced security and compliance
-- Custom reporting dashboards
-`
-        : ""
-}
-
-RESPONSE ENHANCEMENT FOR PRO USERS:
-- Provide more detailed analysis and insights
-- Include cost optimization suggestions
-- Offer predictive recommendations
-- Suggest policy compliance checks
-- Include sustainability metrics when relevant
-- Provide advanced booking strategies
-`
-    : `
-
-FREE TIER LIMITATIONS:
-- Basic travel search and recommendations
-- Limited document processing
-- Standard support
-- Basic expense tracking
-- Encourage upgrade to Pro for advanced features
-`
-
-  const enhancedSystemPrompt = baseSystemPrompt + proEnhancements
-
-  const proContext = isPro
-    ? `
-[PRO USER - ${plan.toUpperCase()} PLAN]
-Enhanced capabilities active: Document OCR, Advanced AI, Priority Support, Analytics
-`
-    : `
-[FREE USER]
-Limited to basic features. Suggest Pro upgrade for advanced capabilities.
+${getPlanSpecificInstructions(plan, isPro)}
 `
 
   return {
-    systemPrompt: enhancedSystemPrompt,
-    userPrompt: `${proContext}
-
-User query: "${message}"
-
-${context ? `Available data: ${context}` : ""}
-
-${isPro ? "Provide comprehensive Pro-level assistance with advanced insights and recommendations." : "Provide helpful basic assistance and highlight Pro features that would benefit the user."}`,
+    systemPrompt: optimizedSystemPrompt,
+    userPrompt: enhancedUserPrompt
   }
 }
 
-function getFallbackResponse(message: string, isPro = false, plan = "free"): string {
-  const lowerMessage = message.toLowerCase()
-
-  const proPrefix = isPro
-    ? `**Suitpax AI Pro ${plan.charAt(0).toUpperCase() + plan.slice(1)} - Advanced Response**\n\n`
-    : ""
-  const proSuffix = !isPro
-    ? `\n\n**Upgrade to Suitpax AI Pro**\n\n• Advanced AI capabilities with deeper insights\n• Document OCR processing for receipts and invoices\n• Predictive travel optimization\n• 24/7 priority support\n• Unlimited features and analytics\n• Starting from just €20/month\n\nUpgrade now to unlock the full potential of AI-powered business travel!`
-    : ""
-
-  if (lowerMessage.includes("madrid") && lowerMessage.includes("london")) {
-    const basicResponse = `**Madrid to London - Business Travel Options**
-
-**Recommended Flights**
-
-**British Airways BA 456** - Premium Choice
-• Departure: 08:30 → Arrival: 10:15 (2h 45m)
-• Price: 245 EUR | Direct flight
-• Features: WiFi, Premium meals, Lounge access
-• Aircraft: Airbus A320 | Business amenities available
-
-**Iberia IB 3170** - Best Value
-• Departure: 14:20 → Arrival: 16:05 (2h 45m) 
-• Price: 198 EUR | Direct flight
-• Features: WiFi, Meal service, Priority boarding
-• Aircraft: Airbus A321 | Spanish carrier advantage
-
-**London Accommodation**
-
-**London Marriott Hotel County Hall**
-• Location: Westminster Bridge Road, London SE1
-• Price: 320 EUR/night | Rating: 4.5/5 stars
-• Business Features: Business Center, Meeting rooms, Concierge
-• Highlights: Thames views, Near Parliament & Big Ben
-• Amenities: WiFi, Gym, Restaurant, 24h Room Service`
-
-    const proEnhancements = isPro
-      ? `
-
-**Pro Analytics & Insights**
-
-• **Cost Optimization:** Book BA 456 for 15% savings vs peak times
-• **Carbon Footprint:** 0.18 tons CO2 (Direct flights reduce emissions by 23%)
-• **Productivity Score:** Morning arrival allows same-day meetings
-• **Policy Compliance:** Within company travel guidelines
-• **Loyalty Benefits:** Earn 1,250 Avios + tier points
-• **Weather Impact:** 92% on-time performance for this route
-• **Alternative Routes:** Consider Gatwick for €30 savings
-
-**Expense Automation**
-
-• Auto-categorize as "Business Travel - International"
-• Pre-fill expense report with flight details
-• Attach digital receipts automatically
-• Calculate per diem allowances for London (€85/day)
-
-**Next-Level Recommendations**
-
-• Book hotel 3 days in advance for 12% additional savings
-• Use corporate Amex for 2x points + travel insurance
-• Schedule return flight Tuesday-Thursday for optimal rates
-• Consider upgrading to Business for long-term client meetings`
-      : ""
-
-    return proPrefix + basicResponse + proEnhancements + proSuffix
+function getPlanSpecificPrompt(plan: string, isPro: boolean): string {
+  const planFeatures = {
+    free: `
+### PLAN GRATUITO
+- Búsquedas básicas de vuelos y hoteles
+- Recomendaciones estándar
+- Respuestas limitadas a información esencial
+- Sugerir upgrade a Pro para funciones avanzadas`,
+    
+    starter: `
+### PLAN STARTER PRO
+- Análisis de documentos básico (10/mes)
+- Insights de viaje estándar
+- Soporte por email
+- Optimización de costos básica`,
+    
+    business: `
+### PLAN BUSINESS PRO
+- Procesamiento ilimitado de documentos
+- Analytics avanzado y reportes
+- Soporte prioritario 24/7
+- Acceso a tarifas corporativas
+- Cumplimiento de políticas de viaje
+- Integración con calendarios`,
+    
+    enterprise: `
+### PLAN ENTERPRISE PRO
+- Todas las funciones Business plus:
+- Entrenamiento de IA personalizado
+- Acceso API e integraciones
+- Gerente de cuenta dedicado
+- Soluciones white-label
+- Seguridad y cumplimiento avanzado
+- Dashboards de reportes personalizados`
   }
 
-  const basicResponse = `**Welcome to Suitpax - Your Complete Business Travel Solution**
+  return planFeatures[plan as keyof typeof planFeatures] || planFeatures.free
+}
 
-I'm Zia, your dedicated AI travel assistant, ready to help with:
+function getPlanSpecificInstructions(plan: string, isPro: boolean): string {
+  if (!isPro) {
+    return `Proporciona asistencia básica útil y destaca las funciones Pro que beneficiarían al usuario.
+Incluye llamada a la acción para upgrade al final.`
+  }
 
-**Smart Flight Search**
-• Compare 500+ airlines worldwide
-• Find direct routes and optimal connections
-• Access exclusive corporate rates
-• Flexible booking with change options
+  const instructions = {
+    starter: `Proporciona asistencia Pro nivel Starter con insights básicos y procesamiento de documentos.`,
+    business: `Proporciona asistencia Pro nivel Business completa con analytics avanzados, optimización de costos y insights profundos.`,
+    enterprise: `Proporciona asistencia Pro nivel Enterprise máxima con todas las capacidades avanzadas, insights predictivos y recomendaciones personalizadas.`
+  }
 
-**Premium Accommodations**
-• Business hotels in 1000+ cities
-• Meeting rooms and conference facilities
-• Corporate rates up to 30% off
-• Loyalty program integration
+  return instructions[plan as keyof typeof instructions] || instructions.starter
+}
 
-**Popular Requests**
-• "Book flights from [city] to [city]"
-• "Find hotels near [business district]"
-• "Plan a 3-day business trip to [destination]"
-• "Help with expense reporting"`
+function getFallbackResponse(message: string, isPro: boolean, plan: string, error?: Error | null): string {
+  const errorContext = error ? `Error context: ${error.message}` : ''
+  
+  const lowerMessage = message.toLowerCase()
+  const planDisplayName = plan.charAt(0).toUpperCase() + plan.slice(1)
+  
+  // Detect language from message
+  const isSpanish = /[ñáéíóúü]/.test(message) || 
+                   /(buscar|vuelo|hotel|viaje|madrid|barcelona|méxico)/i.test(message)
 
-  const proEnhancements = isPro
-    ? `
+  const baseResponse = isSpanish ? getSpanishFallback(lowerMessage, isPro, plan) : getEnglishFallback(lowerMessage, isPro, plan)
+  
+  const proPrefix = isPro ? `**Suitpax AI Pro ${planDisplayName}**\n\n` : ''
+  const upgradePrompt = !isPro ? getUpgradePrompt(isSpanish) : ''
+  
+  return proPrefix + baseResponse + upgradePrompt
+}
 
-**Your Pro Features Active**
+function getSpanishFallback(message: string, isPro: boolean, plan: string): string {
+  if (message.includes('madrid') && message.includes('londres')) {
+    return `**Madrid → Londres - Opciones Corporativas**
 
-• **Document OCR:** Upload receipts, invoices, boarding passes for instant processing
-• **Advanced AI:** Predictive optimization and personalized recommendations
-• **Priority Support:** 24/7 dedicated assistance with faster response times
-• **Analytics Dashboard:** Detailed insights on travel patterns and cost optimization
-• **Policy Compliance:** Automatic checking against company travel policies
-• **Carbon Tracking:** Monitor and offset your business travel footprint
-• **Unlimited Processing:** No limits on searches, bookings, or document uploads
+**Vuelos Recomendados**
+• British Airways BA456: 08:30→10:15 (245€) - Directo, WiFi, Lounge
+• Iberia IB3170: 14:20→16:05 (198€) - Directo, mejor valor
 
-**Pro-Exclusive Commands**
-• "Analyze my travel spending patterns"
-• "Optimize my upcoming trip itinerary"
-• "Process this expense receipt"
-• "Show me carbon-neutral flight options"
-• "Generate monthly travel report"
-• "Check policy compliance for this booking"`
-    : ""
+**Hoteles Ejecutivos**
+• Marriott County Hall: 320€/noche - Vista al Támesis, centro business
+• Hilton London Tower: 285€/noche - Cerca City, meeting rooms
 
-  return proPrefix + basicResponse + proEnhancements + proSuffix
+**Optimización:** Reserva BA456 para reuniones matutinas. Ahorro del 15% reservando con 3 días de antelación.`
+  }
+
+  return `**Bienvenido a Suitpax AI**
+
+Soy tu asistente especializado en viajes corporativos. Puedo ayudarte con:
+
+• **Búsqueda inteligente de vuelos** - 500+ aerolíneas globales
+• **Hoteles ejecutivos** - Tarifas corporativas hasta 30% descuento  
+• **Optimización de costos** - Análisis predictivo de precios
+• **Gestión de gastos** - Procesamiento automático de recibos
+
+**Ejemplos de consultas:**
+"Vuelos de Madrid a Nueva York para el lunes"
+"Hoteles cerca del distrito financiero de Londres"
+"Planifica viaje de negocios 3 días a Tokio"`
+}
+
+function getEnglishFallback(message: string, isPro: boolean, plan: string): string {
+  if (message.includes('madrid') && message.includes('london')) {
+    return `**Madrid → London - Corporate Travel Options**
+
+**Recommended Flights**
+• British Airways BA456: 08:30→10:15 (€245) - Direct, WiFi, Lounge access
+• Iberia IB3170: 14:20→16:05 (€198) - Direct, best value
+
+**Executive Hotels**
+• Marriott County Hall: €320/night - Thames view, business center
+• Hilton London Tower: €285/night - Near City, meeting facilities
+
+**Optimization:** Book BA456 for morning meetings. Save 15% booking 3 days ahead.`
+  }
+
+  return `**Welcome to Suitpax AI**
+
+I'm your specialized corporate travel assistant. I can help you with:
+
+• **Smart flight search** - 500+ global airlines
+• **Executive accommodations** - Corporate rates up to 30% off
+• **Cost optimization** - Predictive pricing analysis  
+• **Expense management** - Automatic receipt processing
+
+**Example queries:**
+"Flights from Madrid to New York for Monday"
+"Hotels near London financial district"
+"Plan 3-day business trip to Tokyo"`
+}
+
+function getUpgradePrompt(isSpanish: boolean): string {
+  return isSpanish ? `
+
+**🚀 Upgrade a Suitpax AI Pro**
+
+• Capacidades de IA avanzadas con insights profundos
+• Procesamiento OCR de recibos y facturas
+• Optimización predictiva de viajes
+• Soporte prioritario 24/7
+• Funciones y analytics ilimitados
+• Desde solo €20/mes
+
+¡Upgrade ahora para desbloquear todo el potencial de la IA!` : `
+
+**🚀 Upgrade to Suitpax AI Pro**
+
+• Advanced AI capabilities with deep insights
+• OCR processing for receipts and invoices  
+• Predictive travel optimization
+• 24/7 priority support
+• Unlimited features and analytics
+• Starting from just €20/month
+
+Upgrade now to unlock the full power of AI-powered business travel!`
+}
+
+function buildErrorResponse(error: unknown): ErrorResponse {
+  if (error instanceof Error) {
+    if (error.message.includes('authentication') || error.message.includes('401')) {
+      return {
+        error: "Authentication failed",
+        code: "AUTH_ERROR",
+        response: "I'm having trouble connecting to my AI services. Please contact support.",
+        suggestions: ["Check API configuration", "Contact technical support"]
+      }
+    }
+    
+    if (error.message.includes('rate_limit') || error.message.includes('429')) {
+      return {
+        error: "Rate limit exceeded",
+        code: "RATE_LIMIT",
+        response: "I'm currently experiencing high demand. Please try again in a moment.",
+        suggestions: ["Wait a few minutes", "Upgrade to Pro for higher limits"]
+      }
+    }
+    
+    if (error.message.includes('timeout')) {
+      return {
+        error: "Request timeout",
+        code: "TIMEOUT",
+        response: "The request is taking longer than expected. Please try again with a shorter message.",
+        suggestions: ["Try a shorter message", "Check your connection"]
+      }
+    }
+  }
+
+  return {
+    error: "Internal server error",
+    code: "INTERNAL_ERROR",
+    response: "I apologize, but I'm experiencing technical difficulties. Please try again in a moment.",
+    suggestions: ["Try again later", "Contact support if the issue persists"]
+  }
 }
